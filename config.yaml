@@ -1,0 +1,4 @@
+include-files:
+    - minimo.go
+exclude-files:
+    - README.md

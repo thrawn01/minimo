@@ -2,6 +2,8 @@ package main
 
 import (
 	"github.com/jessevdk/go-flags"
+	"gopkg.in/yaml.v2"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -17,9 +19,15 @@ type FileStats struct {
 	fileInfo os.FileInfo
 }
 
+type Config struct {
+	IncludeFiles []string `yaml:"include-files"`
+	ExcludeFiles []string `yaml:"exclude-files"`
+}
+
 // Command line argument definition
 var opts struct {
-	Verbose bool `short:"v" long:"verbose" description:"Show verbose debug information"`
+	Verbose bool   `short:"v" long:"verbose" description:"Show verbose debug information"`
+	Conf    string `short:"c" long:"conf" description:"path to the config file" env:"MINIMO_CONF" required:"yes"`
 	Args    struct {
 		Path string `positional-arg-name:"PATH"`
 	} `positional-args:"yes" required:"yes"`
@@ -53,6 +61,20 @@ func main() {
 	if err != nil {
 		os.Exit(-1)
 	}
+
+	// Read the config file
+	rawConfFile, err := ioutil.ReadFile(opts.Conf)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Unmarshal the yaml file into our config struct
+	conf := Config{}
+	err = yaml.Unmarshal(rawConfFile, &conf)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("#%v\n", conf)
+	os.Exit(-1)
 
 	// Get a listing of the file that exists before modification
 	before := walkpath(opts.Args.Path)
