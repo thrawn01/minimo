@@ -1,10 +1,9 @@
 package main
 
 import (
-	"github.com/jessevdk/go-flags"
-	//"gopkg.in/yaml.v2"
 	"fmt"
-	//"io/ioutil"
+	"github.com/jessevdk/go-flags"
+	"gopkg.in/lxc/go-lxc.v1"
 	"log"
 	"os"
 	"os/exec"
@@ -26,19 +25,19 @@ type Config struct {
 		Conf string `positional-arg-name:"CONF" description:"path to the config file" env:"MINIMO_CONF" default:"config.yaml"`
 	} `positional-args:"yes"`
 
-	Platform     string   `long:"platform" description:"Platform to create the image for (Currently only supports debian/ubuntu)" default:"ubuntu"`
-	IncludeFiles []string `long:"include-file" description:"Specify a file to include in the resulting image"`
-	ExcludeFiles []string `long:"exclude-file" description:"Specify a file to exclude from the resulting image"`
-	IncludePkgs  []string `long:"include-pkg" description:"Specify additional package to install in the resulting image"`
-	ExcludePkgs  []string `long:"exclude-pkg" description:"Specify package remove from the resulting image, even if it has as a package dependancy"`
-	Debian       struct {
-		ScratchDir string `long:"scratch-dir" description:"Scratch directory where the bootstrap root is created" default:"/var/minimo"`
-		Suite      string `long:"distro" description:"<suite> argument passed to 'debootstrap'" default:"utopic"`
-		Mirror     string `long:"mirror" description:"<mirror> argument passed to 'debootstrap'" default:"http://archive.ubuntu.com/ubuntu/"`
-		Variant    string `long:"variant" description:"--variant argument passed to 'debootstrap'" default:"buildd"`
-		Arch       string `long:"arch" description:"--arch argument passed to 'debootstrap'" default:"amd64"`
-		Bin        string `long:"bootstrap-bin" description:"Path to 'debootstrap'" default:"/usr/sbin/debootstrap"`
-	} `group:"Debian Bootstrap Options"`
+	Platform         string   `long:"platform" description:"platform to create the image for (Currently only supports debian/ubuntu)" default:"ubuntu"`
+	IncludeFiles     []string `long:"include-file" description:"specify a file to include in the resulting image"`
+	ExcludeFiles     []string `long:"exclude-file" description:"specify a file to exclude from the resulting image"`
+	IncludePkgs      []string `long:"include-pkg" description:"specify additional package to install in the resulting image"`
+	ExcludePkgs      []string `long:"exclude-pkg" description:"specify package remove from the resulting image, even if it has as a package dependancy"`
+	UseTempContainer string   `long:"use-temp-container" description:"Do not create a new temp container, instead use this pre-existing LXC temp container to install packages (useful when debuging issues)"`
+	Apt              struct {
+		BuildDir string `long:"build-dir" description:"scratch directory where the bootstrap root is created" default:"/var/minimo"`
+		Distro   string `long:"distro" description:"name of a dpkg based distro" default:"ubuntu"`
+		Mirror   string `long:"mirror" description:"APT mirror endpoint" default:"http://archive.ubuntu.com/ubuntu/"`
+		Release  string `long:"release" description:"release name" default:"utopic"`
+		Arch     string `long:"arch" description:"which arch to install packages for" default:"amd64"`
+	} `group:"dpkg"`
 }
 
 /*func loadConfig(fileName string) Config {
@@ -56,53 +55,71 @@ type Config struct {
 	return conf
 }*/
 
-// TODO: The scratch dir should probably be a tempdir that gets removed each run
-func createDebianRoot(conf Config) string {
-	debConf := conf.Debian
+// Execute executes the given command in a temporary container.
+func ExecuteInContainer(container *lxc.Container, args ...string) ([]byte, error) {
 
-	// Create our scratch dir if doesn't exist
-	rootPath := fmt.Sprintf("%s/%s", debConf.ScratchDir, debConf.Suite)
-	if _, err := os.Stat(rootPath); os.IsNotExist(err) {
-		err := os.Mkdir(rootPath, 775)
-		if err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		// Always start with a clean root
-		err := os.RemoveAll(rootPath)
-		if err != nil {
-			log.Fatal(err)
-		}
+	cargs := []string{"lxc-execute", "-n", container.Name(), "-P", container.ConfigPath(), "--"}
+	cargs = append(cargs, args...)
+
+	output, err := exec.Command(cargs[0], cargs[1:]...).CombinedOutput()
+	if err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+// TODO: The scratch dir should probably be a tempdir that gets removed each run
+func createContainerHandle(conf Config) (string, *lxc.Container) {
+	// TODO: Generate a temp container name every time
+	containerName := "test"
+
+	// Overide the temp container name if the user asks
+	if len(conf.UseTempContainer) > 0 {
+		containerName = conf.UseTempContainer
 	}
 
-	// debootstrap --variant=buildd --arch amd64 utopic /var/minimo/utopic http://archive.ubuntu.com/ubuntu/
-	cmd := exec.Command(debConf.Bin, "--variant", debConf.Variant, "--arch", debConf.Arch, debConf.Suite, rootPath, debConf.Mirror)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
+	imagePath := fmt.Sprintf("%s/%s", conf.Apt.BuildDir, containerName)
+
+	// Create new image
+	container, err := lxc.NewContainer(containerName, conf.Apt.BuildDir)
 	if err != nil {
 		log.Fatal(err)
 	}
-	return rootPath
+	// TODO: Load the default config file?
+	container.LoadConfigFile(lxc.DefaultConfigPath())
+	// Always be verbose
+	container.SetVerbosity(lxc.Verbose)
+	return imagePath, container
 }
 
-func installDebianPkgs(conf Config) {
+func createAptImage(conf Config, container *lxc.Container) {
+	if container.Defined() {
+		log.Printf("Temp Container '%s' already exists", container.Name())
+		return
+	}
+	log.Println("Creating Temporary Image...")
 
-	// Prepare the chroot
-	/*
-		mount --bind /dev /var/minimo/utopic/dev
-		mount --bind /dev/pts /var/minimo/utopic/dev/pts
-		mount --bind /proc /var/minimo/utopic/proc/
-		mount --bind /sys /var/minimo/utopic/sys
-	*/
+	// TODO: Validate the 'distro' option has a valid LXC template
+	if err := container.Create(conf.Apt.Distro, "-a", conf.Apt.Arch, "-r", conf.Apt.Release, "--mirror", conf.Apt.Mirror); err != nil {
+		log.Fatalf("Error during temp image create '%s'", err)
+		log.Fatal(err)
+	}
+	log.Println("Temporary Image Complete...")
+}
+
+func installAptPkgs(conf Config, container *lxc.Container) {
+
 	for _, pkg := range conf.IncludePkgs {
 		log.Printf("Installing %s", pkg)
-		//
-		// apt-get install --admindir /var/minimo/utopic/var/lib/dpkg --root /var/minimo/utopic -i
+		if output, err := ExecuteInContainer(container, "/usr/bin/touch", "/newfile.txt"); err != nil {
+			log.Fatalf("Error while installing '%s' - '%s'", pkg, err)
+		} else {
+			log.Println(output)
+		}
 	}
 }
 
-func removeDebianPkgs(conf Config) {
+func removeAptPkgs(conf Config, container *lxc.Container) {
 	for _, pkg := range conf.ExcludePkgs {
 		log.Printf("Removing %s", pkg)
 	}
@@ -145,25 +162,30 @@ func main() {
 	//conf := loadConfig(opts.Conf)
 	//log.Printf("#%v\n", conf)
 
-	// Create a rootfs
-	rootPath := createDebianRoot(conf)
+	// Create an LXC container to handle image creation
+	imagePath, container := createContainerHandle(conf)
+	// Clean up the container when we exit
+	defer lxc.PutContainer(container)
+
+	// Create image
+	createAptImage(conf, container)
 
 	// Get a listing of the base debian system prior to requested package installation
-	before := walkpath(rootPath)
+	before := walkpath(imagePath)
 
 	// Install the requested packages
-	installDebianPkgs(conf)
+	installAptPkgs(conf, container)
 	// Remove any requested package ignoring any depedencies
-	removeDebianPkgs(conf)
+	removeAptPkgs(conf, container)
 
-	/*newFile := fmt.Sprintf("%s/newFile.txt", rootPath)
+	/*newFile := fmt.Sprintf("%s/newFile.txt", imagePath)
 	err = exec.Command("/usr/bin/touch", newFile).Run()
 	if err != nil {
 		log.Fatal(err)
 	}*/
 
 	// Get a listing off all the files after package installation
-	after := walkpath(rootPath)
+	after := walkpath(imagePath)
 
 	// Look for files that existed before, but now deleted
 	for key, value := range before {
