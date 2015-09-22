@@ -2,22 +2,19 @@ package main
 
 import (
 	"fmt"
+	//"github.com/fatih/structs"
 	"github.com/jessevdk/go-flags"
 	"gopkg.in/lxc/go-lxc.v1"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 )
 
 var Version = "0.0.1"
-
-// Holds the Stats of a file
-type FileStats struct {
-	name     string
-	fileInfo os.FileInfo
-}
 
 type Config struct {
 	Verbose bool `short:"v" long:"verbose" description:"Show verbose debug information"`
@@ -57,15 +54,16 @@ type Config struct {
 
 // Execute executes the given command in a temporary container.
 func ExecuteInContainer(container *lxc.Container, args ...string) ([]byte, error) {
-
 	cargs := []string{"lxc-execute", "-n", container.Name(), "-P", container.ConfigPath(), "--"}
 	cargs = append(cargs, args...)
 
-	output, err := exec.Command(cargs[0], cargs[1:]...).CombinedOutput()
-	if err != nil {
+	cmd := exec.Command(cargs[0], cargs[1:]...)
+	log.Printf("Executing: %s\n", strings.Join(cmd.Args, " "))
+	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, err
+	} else {
+		return output, nil
 	}
-	return output, nil
 }
 
 // TODO: The scratch dir should probably be a tempdir that gets removed each run
@@ -78,7 +76,7 @@ func createContainerHandle(conf Config) (string, *lxc.Container) {
 		containerName = conf.UseTempContainer
 	}
 
-	imagePath := fmt.Sprintf("%s/%s", conf.Apt.BuildDir, containerName)
+	imagePath := fmt.Sprintf("%s/%s/rootfs", conf.Apt.BuildDir, containerName)
 
 	// Create new image
 	container, err := lxc.NewContainer(containerName, conf.Apt.BuildDir)
@@ -108,14 +106,17 @@ func createAptImage(conf Config, container *lxc.Container) {
 }
 
 func installAptPkgs(conf Config, container *lxc.Container) {
+	pkgs := strings.Join(conf.IncludePkgs, " ")
+	log.Printf("Installing %s", pkgs)
 
-	for _, pkg := range conf.IncludePkgs {
-		log.Printf("Installing %s", pkg)
-		if output, err := ExecuteInContainer(container, "/usr/bin/touch", "/newfile.txt"); err != nil {
-			log.Fatalf("Error while installing '%s' - '%s'", pkg, err)
-		} else {
-			log.Println(output)
-		}
+	cargs := []string{"apt-get", "install", "-y"}
+	cargs = append(cargs, conf.IncludePkgs...)
+	if output, err := ExecuteInContainer(container, cargs...); err != nil {
+		log.Printf("%s\n", string(output))
+		//log.Println(strings.Join(output, "\n"))
+		log.Fatalf("Error while installing '%s' - '%s'", pkgs, err)
+	} else {
+		log.Println(output)
 	}
 }
 
@@ -126,24 +127,72 @@ func removeAptPkgs(conf Config, container *lxc.Container) {
 }
 
 // Walks the path provided and return a slice of fileStat structs
-func walkpath(rootPath string) map[string]FileStats {
-	var results = make(map[string]FileStats)
+func walkpath(rootPath string, ignoreRegexes []*regexp.Regexp) map[string]os.FileInfo {
+	var results = make(map[string]os.FileInfo)
 
 	// Walk the rootPath
 	filepath.Walk(rootPath, func(path string, fileInfo os.FileInfo, err error) error {
 		if err != nil {
 			log.Fatal(err)
 		}
-		// Skip the dot file
-		if path == "." {
-			return nil
+		// Remove the relative path
+		path = path[len(rootPath):]
+		// Skip any files/directories that match our ignore list
+		for _, regex := range ignoreRegexes {
+			if regex.MatchString(path) {
+				return nil
+			}
 		}
-		// Create a new FileStats struct and add it to the list
-		results[path] = FileStats{name: path, fileInfo: fileInfo}
+		results[path] = fileInfo
 		return nil
 	})
 
 	return results
+}
+
+func buildModifiedFiles(preInstalledFiles map[string]os.FileInfo, postInstalledFiles map[string]os.FileInfo) []os.FileInfo {
+	var modifiedFiles = make([]os.FileInfo, 500)
+	// Look for files that where changed or deleted during the package installation
+	for key, preFile := range preInstalledFiles {
+		postFile, exists := postInstalledFiles[key]
+		if !exists {
+			log.Printf("DELETED '%s' - bytes: %d mtime: (%s)\n", key, preFile.Size(), preFile.ModTime().Format(time.UnixDate))
+			continue
+		}
+		// Did any of the existing files get updated or modified?
+		if postFile.Size() != preFile.Size() {
+			log.Printf("CHANGED '%s' - Size '%d' to '%d'\n", key, preFile.Size(), postFile.Size())
+			modifiedFiles = append(modifiedFiles, postFile)
+			continue
+		}
+		if postFile.Mode() != preFile.Mode() {
+			log.Printf("CHANGED '%s' - Mode '%d' to '%d'\n", key, preFile.Mode(), postFile.Mode())
+			modifiedFiles = append(modifiedFiles, postFile)
+			continue
+		}
+		if postFile.IsDir() != preFile.IsDir() {
+			log.Printf("CHANGED '%s' - IsDir '%t' to '%t'\n", key, preFile.IsDir(), postFile.IsDir())
+			modifiedFiles = append(modifiedFiles, postFile)
+			continue
+		}
+		if postFile.ModTime() != preFile.ModTime() {
+			log.Printf("CHANGED '%s' - ModTime '%s' to '%s'\n", key,
+				preFile.ModTime().Format(time.UnixDate),
+				postFile.ModTime().Format(time.UnixDate))
+			modifiedFiles = append(modifiedFiles, postFile)
+			continue
+		}
+	}
+
+	for key, postFile := range postInstalledFiles {
+		// Look for files that existed before, but now deleted
+		_, exists := preInstalledFiles[key]
+		if !exists {
+			log.Printf("NEW '%s' - bytes: %d mtime: (%s)\n", key, postFile.Size(), postFile.ModTime().Format(time.UnixDate))
+			modifiedFiles = append(modifiedFiles, postFile)
+		}
+	}
+	return modifiedFiles
 }
 
 // Compare directory structure before and after filesystem modification.
@@ -162,6 +211,12 @@ func main() {
 	//conf := loadConfig(opts.Conf)
 	//log.Printf("#%v\n", conf)
 
+	ignoreRegexes := []*regexp.Regexp{
+		regexp.MustCompile(`^$`),
+		regexp.MustCompile(`^\.$`),
+		regexp.MustCompile(`^/dev.*$`),
+	}
+
 	// Create an LXC container to handle image creation
 	imagePath, container := createContainerHandle(conf)
 	// Clean up the container when we exit
@@ -171,35 +226,29 @@ func main() {
 	createAptImage(conf, container)
 
 	// Get a listing of the base debian system prior to requested package installation
-	before := walkpath(imagePath)
+	preInstalledFiles := walkpath(imagePath, ignoreRegexes)
 
 	// Install the requested packages
 	installAptPkgs(conf, container)
 	// Remove any requested package ignoring any depedencies
 	removeAptPkgs(conf, container)
 
-	/*newFile := fmt.Sprintf("%s/newFile.txt", imagePath)
-	err = exec.Command("/usr/bin/touch", newFile).Run()
-	if err != nil {
-		log.Fatal(err)
-	}*/
-
 	// Get a listing off all the files after package installation
-	after := walkpath(imagePath)
+	postInstalledFiles := walkpath(imagePath, ignoreRegexes)
 
-	// Look for files that existed before, but now deleted
-	for key, value := range before {
-		_, exists := after[key]
-		if !exists {
-			log.Printf("DELETED '%s' - bytes: %d mtime: (%s)\n", key, value.fileInfo.Size(), value.fileInfo.ModTime().Format(time.UnixDate))
-		}
+	// Build a list of files that where modified or created during the install process
+	modifiedFiles := buildModifiedFiles(preInstalledFiles, postInstalledFiles)
+
+	for _, fileInfo := range modifiedFiles {
+		log.Printf("Modified: %s", fileInfo.Name())
 	}
 
-	for key, value := range after {
-		// Look for files that existed before, but now deleted
-		_, exists := before[key]
-		if !exists {
-			log.Printf("NEW '%s' - bytes: %d mtime: (%s)\n", key, value.fileInfo.Size(), value.fileInfo.ModTime().Format(time.UnixDate))
-		}
-	}
+	// Build a list of packages based on the dependencies of the install package
+	//depends = buildDependencyList(conf)
+
+	// Build a list of files that our install package depends on
+	//dependantFiles = buildFileList(depends)
+
+	// Merge the depedant files with the list of files that where modified during our installation
+	//sparedFiles = merge(modifiedFiles, dependantFiles)
 }
