@@ -59,11 +59,7 @@ func ExecuteInContainer(container *lxc.Container, args ...string) ([]byte, error
 
 	cmd := exec.Command(cargs[0], cargs[1:]...)
 	log.Printf("Executing: %s\n", strings.Join(cmd.Args, " "))
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return nil, err
-	} else {
-		return output, nil
-	}
+	return cmd.CombinedOutput()
 }
 
 // TODO: The scratch dir should probably be a tempdir that gets removed each run
@@ -111,12 +107,10 @@ func installAptPkgs(conf Config, container *lxc.Container) {
 
 	cargs := []string{"apt-get", "install", "-y"}
 	cargs = append(cargs, conf.IncludePkgs...)
-	if output, err := ExecuteInContainer(container, cargs...); err != nil {
-		log.Printf("%s\n", string(output))
-		//log.Println(strings.Join(output, "\n"))
+	output, err := ExecuteInContainer(container, cargs...)
+	fmt.Println(string(output))
+	if err != nil {
 		log.Fatalf("Error while installing '%s' - '%s'", pkgs, err)
-	} else {
-		log.Println(output)
 	}
 }
 
@@ -206,6 +200,8 @@ func main() {
 		}
 		log.Fatal(err)
 	}
+
+	// TODO: run lxc-checkconfig to ensure lxc is working properly
 
 	// Load our config file
 	//conf := loadConfig(opts.Conf)
