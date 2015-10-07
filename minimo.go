@@ -149,33 +149,29 @@ func buildModifiedFiles(preInstalledFiles map[string]os.FileInfo, postInstalledF
 	// Look for files that where changed or deleted during the package installation
 	for key, preFile := range preInstalledFiles {
 		postFile, exists := postInstalledFiles[key]
-		if !exists {
-			log.Printf("DELETED '%s' - bytes: %d mtime: (%s)\n", key, preFile.Size(), preFile.ModTime().Format(time.UnixDate))
-			continue
-		}
-		// Did any of the existing files get updated or modified?
-		if postFile.Size() != preFile.Size() {
-			log.Printf("CHANGED '%s' - Size '%d' to '%d'\n", key, preFile.Size(), postFile.Size())
-			modifiedFiles = append(modifiedFiles, postFile)
-			continue
-		}
-		if postFile.Mode() != preFile.Mode() {
-			log.Printf("CHANGED '%s' - Mode '%d' to '%d'\n", key, preFile.Mode(), postFile.Mode())
-			modifiedFiles = append(modifiedFiles, postFile)
-			continue
-		}
-		if postFile.IsDir() != preFile.IsDir() {
-			log.Printf("CHANGED '%s' - IsDir '%t' to '%t'\n", key, preFile.IsDir(), postFile.IsDir())
-			modifiedFiles = append(modifiedFiles, postFile)
-			continue
-		}
-		if postFile.ModTime() != preFile.ModTime() {
-			log.Printf("CHANGED '%s' - ModTime '%s' to '%s'\n", key,
-				preFile.ModTime().Format(time.UnixDate),
-				postFile.ModTime().Format(time.UnixDate))
-			modifiedFiles = append(modifiedFiles, postFile)
-			continue
-		}
+		switch {
+			case !exists: 
+				log.Printf("DELETED '%s' - bytes: %d mtime: (%s)\n", key, preFile.Size(), preFile.ModTime().Format(time.UnixDate))				
+			// Did any of the existing files get updated or modified?
+			case postFile.Size() != preFile.Size(): {
+				log.Printf("CHANGED '%s' - Size '%d' to '%d'\n", key, preFile.Size(), postFile.Size())
+				modifiedFiles = append(modifiedFiles, postFile)				
+			}	
+			case postFile.Mode() != preFile.Mode(): {
+				log.Printf("CHANGED '%s' - Mode '%d' to '%d'\n", key, preFile.Mode(), postFile.Mode())
+				modifiedFiles = append(modifiedFiles, postFile)				
+			}
+			case postFile.IsDir() != preFile.IsDir(): {
+				log.Printf("CHANGED '%s' - IsDir '%t' to '%t'\n", key, preFile.IsDir(), postFile.IsDir())
+				modifiedFiles = append(modifiedFiles, postFile)				
+			}
+			case postFile.ModTime() != preFile.ModTime(): {
+				log.Printf("CHANGED '%s' - ModTime '%s' to '%s'\n", key,
+					preFile.ModTime().Format(time.UnixDate),
+					postFile.ModTime().Format(time.UnixDate))
+				modifiedFiles = append(modifiedFiles, postFile)
+			}
+	    }
 	}
 
 	for key, postFile := range postInstalledFiles {
