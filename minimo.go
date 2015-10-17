@@ -4,12 +4,14 @@ import (
 	"fmt"
 	//"github.com/fatih/structs"
 	"github.com/jessevdk/go-flags"
+	"gopkg.in/fatih/set.v0"
 	"gopkg.in/lxc/go-lxc.v1"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,8 +19,9 @@ import (
 var Version = "0.0.1"
 
 type Config struct {
-	Verbose bool `short:"v" long:"verbose" description:"Show verbose debug information"`
-	Args    struct {
+	Verbose           bool `short:"v" long:"verbose" description:"Show verbose debug information"`
+	KeepTempContainer bool `short:"k" long:"keep-temp" description:"Do not delete the temporary container used to create the image"`
+	Args              struct {
 		Conf string `positional-arg-name:"CONF" description:"path to the config file" env:"MINIMO_CONF" default:"config.yaml"`
 	} `positional-args:"yes"`
 
@@ -52,20 +55,55 @@ type Config struct {
 	return conf
 }*/
 
+// Build a dependency list based on the list of packages requested to install
+func buildDependencyList(container *lxc.Container, pkgs []string) set.Interface {
+	regex, err := regexp.Compile(`(Depends|PreDepends): (\w+)`)
+	if err != nil {
+		log.Fatal("Unable to compile regexp for buildDependencyList()")
+	}
+
+	results := set.New()
+	// For each package in the IncludePkgs list
+	for _, pkg := range pkgs {
+		// Fetch it's dependency list
+		output, err := executeInContainer(container, "apt-cache", "depends", pkg)
+		if err != nil {
+			log.Fatalf("Error while fetching dependancy for '%s' - '%s'", pkg, err)
+		}
+		depends := make([]string, 5)
+		matches := regex.FindAllStringSubmatch(output, -1)
+		for match, pkgName := range matches {
+			log.Printf("Match: %s Package: %s", match, pkgName)
+			//depends = append(depends, pkgName)
+		}
+		log.Println(depends)
+		// recursively decend the dependancy tree
+		//results.Merge(buildDependencyList(depends))
+	}
+	return results
+}
+
 // Execute executes the given command in a temporary container.
-func ExecuteInContainer(container *lxc.Container, args ...string) ([]byte, error) {
+func executeInContainer(container *lxc.Container, args ...string) (string, error) {
 	cargs := []string{"lxc-execute", "-n", container.Name(), "-P", container.ConfigPath(), "--"}
 	cargs = append(cargs, args...)
 
 	cmd := exec.Command(cargs[0], cargs[1:]...)
 	log.Printf("Executing: %s\n", strings.Join(cmd.Args, " "))
-	return cmd.CombinedOutput()
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+func randName() string {
+	rand := uint32(time.Now().UnixNano() + int64(os.Getpid()))
+	rand = (rand * 1664525) + 1013904223 // constants from Numerical Recipes
+	return strconv.Itoa(int(1e9 + (rand % 1e9)))[1:]
 }
 
 // TODO: The scratch dir should probably be a tempdir that gets removed each run
 func createContainerHandle(conf Config) (string, *lxc.Container) {
 	// TODO: Generate a temp container name every time
-	containerName := "test"
+	containerName := randName()
 
 	// Overide the temp container name if the user asks
 	if len(conf.UseTempContainer) > 0 {
@@ -107,8 +145,8 @@ func installAptPkgs(conf Config, container *lxc.Container) {
 
 	cargs := []string{"apt-get", "install", "-y"}
 	cargs = append(cargs, conf.IncludePkgs...)
-	output, err := ExecuteInContainer(container, cargs...)
-	fmt.Println(string(output))
+	output, err := executeInContainer(container, cargs...)
+	fmt.Println(output)
 	if err != nil {
 		log.Fatalf("Error while installing '%s' - '%s'", pkgs, err)
 	}
@@ -150,28 +188,32 @@ func buildModifiedFiles(preInstalledFiles map[string]os.FileInfo, postInstalledF
 	for key, preFile := range preInstalledFiles {
 		postFile, exists := postInstalledFiles[key]
 		switch {
-			case !exists: 
-				log.Printf("DELETED '%s' - bytes: %d mtime: (%s)\n", key, preFile.Size(), preFile.ModTime().Format(time.UnixDate))				
-			// Did any of the existing files get updated or modified?
-			case postFile.Size() != preFile.Size(): {
+		case !exists:
+			log.Printf("DELETED '%s' - bytes: %d mtime: (%s)\n", key, preFile.Size(), preFile.ModTime().Format(time.UnixDate))
+		// Did any of the existing files get updated or modified?
+		case postFile.Size() != preFile.Size():
+			{
 				log.Printf("CHANGED '%s' - Size '%d' to '%d'\n", key, preFile.Size(), postFile.Size())
-				modifiedFiles = append(modifiedFiles, postFile)				
-			}	
-			case postFile.Mode() != preFile.Mode(): {
+				modifiedFiles = append(modifiedFiles, postFile)
+			}
+		case postFile.Mode() != preFile.Mode():
+			{
 				log.Printf("CHANGED '%s' - Mode '%d' to '%d'\n", key, preFile.Mode(), postFile.Mode())
-				modifiedFiles = append(modifiedFiles, postFile)				
+				modifiedFiles = append(modifiedFiles, postFile)
 			}
-			case postFile.IsDir() != preFile.IsDir(): {
+		case postFile.IsDir() != preFile.IsDir():
+			{
 				log.Printf("CHANGED '%s' - IsDir '%t' to '%t'\n", key, preFile.IsDir(), postFile.IsDir())
-				modifiedFiles = append(modifiedFiles, postFile)				
+				modifiedFiles = append(modifiedFiles, postFile)
 			}
-			case postFile.ModTime() != preFile.ModTime(): {
+		case postFile.ModTime() != preFile.ModTime():
+			{
 				log.Printf("CHANGED '%s' - ModTime '%s' to '%s'\n", key,
 					preFile.ModTime().Format(time.UnixDate),
 					postFile.ModTime().Format(time.UnixDate))
 				modifiedFiles = append(modifiedFiles, postFile)
 			}
-	    }
+		}
 	}
 
 	for key, postFile := range postInstalledFiles {
@@ -212,13 +254,24 @@ func main() {
 	// Create an LXC container to handle image creation
 	imagePath, container := createContainerHandle(conf)
 	// Clean up the container when we exit
-	defer lxc.PutContainer(container)
+	defer func() {
+		if err := container.Destroy(); err != nil {
+			log.Fatalln(err.Error())
+		}
+		lxc.PutContainer(container)
+		if !conf.KeepTempContainer {
+			os.RemoveAll(imagePath)
+		}
+	}()
+
+	log.Printf("Temp Image Path: '%s'", imagePath)
 
 	// Create image
 	createAptImage(conf, container)
 
 	// Get a listing of the base debian system prior to requested package installation
 	preInstalledFiles := walkpath(imagePath, ignoreRegexes)
+	//log.Printf("preInstalledFiles: %s", preInstalledFiles)
 
 	// Install the requested packages
 	installAptPkgs(conf, container)
@@ -227,17 +280,20 @@ func main() {
 
 	// Get a listing off all the files after package installation
 	postInstalledFiles := walkpath(imagePath, ignoreRegexes)
+	log.Printf("postInstalledFiles: %s", postInstalledFiles)
 
 	// Build a list of files that where modified or created during the install process
 	modifiedFiles := buildModifiedFiles(preInstalledFiles, postInstalledFiles)
 
+	log.Printf("modifiedFile len: %d", len(modifiedFiles))
+	log.Printf("modifiedFiles: %s", modifiedFiles)
 	for _, fileInfo := range modifiedFiles {
 		log.Printf("Modified: %s", fileInfo.Name())
 	}
 
 	// Build a list of packages based on the dependencies of the install package
-	//depends = buildDependencyList(conf)
-
+	depends := buildDependencyList(container, conf.IncludePkgs)
+	fmt.Println(depends)
 	// Build a list of files that our install package depends on
 	//dependantFiles = buildFileList(depends)
 
