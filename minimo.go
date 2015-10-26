@@ -35,7 +35,7 @@ type Config struct {
 		BuildDir string `long:"build-dir" description:"scratch directory where the bootstrap root is created" default:"/var/minimo"`
 		Distro   string `long:"distro" description:"name of a dpkg based distro" default:"ubuntu"`
 		Mirror   string `long:"mirror" description:"APT mirror endpoint" default:"http://archive.ubuntu.com/ubuntu/"`
-		Release  string `long:"release" description:"release name" default:"utopic"`
+		Release  string `long:"release" description:"release name" default:"vivid"`
 		Arch     string `long:"arch" description:"which arch to install packages for" default:"amd64"`
 	} `group:"dpkg"`
 }
